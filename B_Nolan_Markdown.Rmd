@@ -1,0 +1,197 @@
+---
+title: "Police Attendance Model"
+author: "Brendan Nolan"
+date: "16/04/2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, collapse = TRUE, comment = "#>")
+```
+ 
+## Setup
+
+The task is to produce a model which will predict whether or not a police officer will attend the scene of a car accident.
+For this, I am using the 2014 UK government road safety data, available from gov.co.uk.
+
+First I load the required packages and import the data, renaming the columns to make them consistent with R's naming conventions and to make them easier to work with. I also set a seed for random number generation. 
+
+```{r pkgs, message=FALSE}
+pkgs <- c("tidyverse", "mlr", "janitor", "lubridate", "here")
+invisible(lapply(pkgs, library, character.only = TRUE))
+set.seed(1)
+```
+
+```{r import}
+raw_data <- read_csv(here("DfTRoadSafety_Accidents_2014.csv")) %>%
+  clean_names()
+glimpse(raw_data)
+```
+
+Three challenges are evident immediately:
+
+* There is a very large number of observations.
+* There is a very large number of variables. 
+* Most variables are categorical, which will necessitate many dummy variables if I choose a logistic-regression-type technique. 
+
+## Data Preparation
+
+Next, I make sure that the data which should be numerical is in numeric format and that the categorical data is in factor format. In this step, I also remove a few columns:
+
+* `accident_index` is just an identifier, so there's no meaningful information there
+* `location_easting_osgr` and `location_northing_osgr` are just different measures of `latitude` and `longitude` so I remove them (and keep `latitude` and `longitude`)
+* `x1st_road_number`, `x2nd_road_class` and `x2nd_road_number`, `local_authority_highway` and `lsoa_of_accident_location` are categorical variables with too many levels (relative to the number of samples in the data) for each level to have a significant meaning, so I remove them.
+* `local_authority_district` captures regional information which is highly correlated with that of `police_force`, so I remove `local_authority_district` and keep `police_force`. 
+
+I do not code `time` as numeric because this misses the fact that 23:59 is very close to 00:00. Instead I use `hour_of_day` (categorical variable with 24 levels). For similar reasons, I convert `date` to `month`. 
+```{r pressure}
+transformed_data <- raw_data %>%
+  transmute(
+    longitude = longitude,
+    latitude = latitude,
+    police_force = as.factor(police_force),
+    accident_severity = as.factor(accident_severity),
+    number_of_vehicles = number_of_vehicles,
+    number_of_casualties = number_of_casualties,
+    month = as.factor(month(dmy(date))),
+    day_of_week = as.factor(day_of_week),
+    hour_of_day = as.factor(hour(hms(time))),
+    first_road_class = as.factor(x1st_road_class),
+    road_type = as.factor(road_type),
+    speed_limit = as.factor(speed_limit),
+    junction_detail = as.factor(junction_detail),
+    junction_control = as.factor(junction_control),
+    pedestrian_crossing_human_control =
+      as.factor(pedestrian_crossing_human_control),
+    pedestrian_crossing_physical_facilities =
+      as.factor(pedestrian_crossing_physical_facilities),
+    light_conditions = as.factor(light_conditions),
+    weather_conditions = as.factor(weather_conditions),
+    road_surface_conditions = as.factor(road_surface_conditions),
+    special_conditions_at_site = as.factor(special_conditions_at_site),
+    carriageway_hazards = as.factor(carriageway_hazards),
+    urban_or_rural_area = as.factor(urban_or_rural_area),
+    did_police_officer_attend_scene_of_accident =
+      as.factor(did_police_officer_attend_scene_of_accident)
+    ) %>%
+  as.data.frame() %>%  # mlr prefers data frames to tibbles
+  removeConstantFeatures() %>%
+  drop_na()  # remove rows with missing values
+```
+
+
+Next, I (randomly) create the indices of the training and test sets.
+```{r training and test indices}
+nr <- nrow(transformed_data)
+train_indices <- sample.int(nr, nr * (2 / 3))
+test_indices <- setdiff(seq_len(nr), train_indices)
+```
+
+## The simplest possible model
+
+The simplest possible model would say that a police officer always attends the scene of a traffic accident. I will crudely compare other models to this, in order to get an impression of whether or not those models are effective. I would like to estimate the test error rate of this model. Since there is no fitting (hence no danger of overfitting) I can estimate the test error rate by the training error rate (note that `did_police_officer_attend_scene_of_accident` is coded as `1` for `TRUE` and `2` for FALSE.):
+```{r}
+mean(transformed_data[train_indices, ]$did_police_officer_attend_scene_of_accident == 2)
+```
+
+
+
+## Penalized logistic regression
+The first thing I try is a penalized logistic regression. Penalizing is designed to avoid over-fitting, which is a big danger with so many variables. LASSO penalised logistic regression also reduces the number of variables by setting some coefficients to zero. 
+
+I use the `mlr` (_Machine Learning with R_) package for this. 
+
+First I set up the generic machine learning task at hand, with the data and target variable. I also set up a sub-task for tuning the hyperparameter (choosing the best hyperparameter `lambda1` for the lasso-penalized logistic regression).
+
+```{r plr tasks}
+generic_task <- makeClassifTask("road_safety", data = transformed_data,
+                  target = "did_police_officer_attend_scene_of_accident") %>%
+  removeConstantFeatures()
+
+tune_task <- generic_task %>%
+  subsetTask(train_indices) %>%
+  removeConstantFeatures()
+```
+
+Next I set up the LASSO penalized logistic regression learning procedure, including the possible choices of hyperparameter `lambda1` that I want to iterate over in order to choose the best one via 5-fold cross-validation. For the sake of time, I choose a small set of possible values for `lambda1`, using powers of 2 in order to have values spread over a relatively wide range. I create the learner with `makePreprocWrapperCaret()`. Creating a learner with `makePreprocWrapperCaret()` has the following advatnage: when called, such a learner will automatically preprocess the data in the appropriate fashion. 
+
+At this point, it is worth acknowledging that I may be missing the most effective values of `lambda1`. I choose high values of `lambda1` because for low values - particularly those below 1 - the code takes a very long time to run. The long runtime is likely at least partially due to the large number of variables and in particular to the large number of categorical variables, many of which have a large number of levels; as such, the regression requires the coding of an extremely large number of dummy variables. This necessitates the fitting of almost two-hundred coefficients, which is inevitably slow and possibly quite unreliable.
+```{r plr learning}
+learner_plr <- makePreprocWrapperCaret("classif.penalized")
+resamp <- makeResampleDesc("CV", iters = 5,
+                           stratify = TRUE)
+lambda1_set <- makeParamSet(makeDiscreteParam("lambda1",
+                                              values = 2 ^ (7:5)))
+ctrl <- makeTuneControlGrid()
+```
+
+Next I do the parameter tuning:
+```{r plr tuning}
+tuned_plr <- tuneParams(learner_plr, tune_task, resampling = resamp,
+                        par.set = lambda1_set, control = ctrl)
+```
+The best `lambda1` is given by `tuned_plr$x$lambda1` - namely `r tuned_plr$x$lambda1` - so I will go with that. The `mmce` (_Mean MisClassification Error_) was `r tuned_plr$y["mmce.test.mean"]`. So now I can choose the best penalized logistic regression model (subject to the range of possible hyperparameters which I allowed):
+```{r}
+best_learner_plr <- setHyperPars(learner_plr, par.vals = tuned_plr$x)
+model_plr <- train(best_learner_plr, generic_task, subset = train_indices)
+```
+As I said above, the mmce of this `model_plr` is `r tuned_plr$y["mmce.test.mean"]`, which is the estimated test error rate. This does not improve much upon the simplest possible model (which assumes that a police officer always turns up), whose estimated test error rate was computed above to be `r mean(transformed_data[train_indices, ]$did_police_officer_attend_scene_of_accident == 2)`. Nevertheless, `model_plr` is slightly better and I may be able to use it for inference. Hopefully, the LASSO model will have set most of the almost-two-hundred fitted coefficients to zero:
+```{r}
+getLearnerModel(model_plr, more.unwrap = TRUE)
+```
+That still leaves me with a very large number of nonzero regression coefficients and it is difficult to do much inference here. The best I can do is to graph the information gain of each of the variables.
+```{r}
+generateFilterValuesData(tune_task, method = "information.gain")$data %>%
+  ggplot(aes(x = name, y = information.gain)) +
+  geom_bar(stat = "identity") +
+  coord_flip()
+```
+ 
+
+Given the limitations of my penalized logistic regression approach and the fact that it is not much better than the model that predicts a police officer always attends, I will now try gradient boosting as an alternative method. 
+
+
+## Gradient Boosted Method
+
+In order to choose the best boosted trees method, I will again choose a set of hyperparameters to iterate over in order to choose the best ones via 5-fold cross validation. If I had more time, I would choose greater possible ranges of the hyperparameters. 
+
+```{r create trained model, results = 'hide'}
+learner_gbm <- makePreprocWrapperCaret("classif.gbm")
+param_set_gbm <- makeParamSet(
+                   makeDiscreteParam("n.trees", values = 50 * 2 ^ (0:4)),
+                   makeDiscreteParam("interaction.depth", values = 1:2),
+                   makeDiscreteParam("shrinkage", values = 2 ^ (-3:-4)))
+tuned_gbm <- tuneParams(learner_gbm, task = tune_task, resampling = resamp,
+                        par.set = param_set_gbm, control = ctrl)
+
+```
+I see that the best `n.trees`, `interaction.depth`, and `shrinkage` were respectively `r tuned_gbm$x$n.trees`, `r tuned_gbm$x$interaction.depth`, and `r tuned_gbm$x$shrinkage`, so I'll go with those. The `mmce` was `r tuned_gbm$y["mmce.test.mean"]`. So now I can choose the best GBM model (subject to my hyperparameter choice):
+```{r}
+best_learner_gbm <- setHyperPars(learner_gbm, par.vals = tuned_gbm$x)
+model_gbm <- train(best_learner_gbm, generic_task, subset = train_indices)
+```
+This is slightly better (in terms of mmce) than my chosen penalized logistic regression model, so I will choose `model_gbm` as my final model. I now check how it performs on the test set:
+```{r}
+task_pred_gbm <- predict(model_gbm, task = generic_task, subset = test_indices)
+glimpse(as.data.frame(task_pred_gbm))
+pred_gbm_df <- as.data.frame(task_pred_gbm) %>%
+  mutate(truth = if_else(truth == "1", "Y", "N"),
+         response = if_else(response == "1", "Y", "N"))
+head(pred_gbm_df)
+group_by(pred_gbm_df, response) %>% summarise(n = n())
+conf_mat <- calculateConfusionMatrix(task_pred_gbm)
+conf_mat
+```
+(When interpreting this confusion matrix, recall that `did_police_officer_attend_scene_of_accident` is coded as `1` for `TRUE` and `2` for FALSE.)
+
+
+
+
+## Conclusion
+
+I can conclude quite a lot from the confusion matrix `conf_mat`: if I view a positive as a police officer attending an accident, then the model `model_gbm` is very sensitive - almost every time a police officer attended, this was predicted by the model. However the model is not very specific - almost every time a police officer did not attend, the model failed to predict this. So the model has a poor sensitivity-specificity tradeoff. In spite of its drawbacks, the model is redeemed somewhat by its negative predictive value. It is quite a bold claim to predict that a police officer will not attend the scene of an accident and the model is quite accurate when it makes this claim: it has a negative predictive value of `r (conf_mat$result)[2,2]/((conf_mat$result)[1,2] + (conf_mat$result)[2,2])`. (Negative predictive value is defined as the proportion of negative predictions which are correct.)
+
+Here is what I think is happening: even though many combinations of the variables can reduce the probability that a police officer will attend the scene of an accident, this probability is almost never below 0.5, so that it is almost always wise to predict that a police officer will attend. Indeed my chosen model `model_gbm` almost always predicts that a police officer will attend. 
+
+
+ 
